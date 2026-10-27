@@ -4,15 +4,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
-
-from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+import logging
+from fastapi import FastAPI, HTTPException, Request
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from app.telemetry import setup_telemetry
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
-
+request_counter = setup_telemetry()
+logger = logging.getLogger(__name__)
 
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -77,7 +80,24 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app)
 
+@app.middleware("http")
+async def count_requests(request: Request, call_next):
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        request_counter.add(
+            1,
+            {
+                "http.route": route.path if route else request.url.path,
+                "http.status_code": status_code,
+            },
+        )
 
 @app.get("/")
 def index():
@@ -102,10 +122,10 @@ def list_orders():
 def get_order(order_id: str):
     with connect() as db:
         row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    logger.info("order lookup", extra={"order_id": order_id, "found": row is not None})
     if row is None:
         raise HTTPException(404, "Order not found")
     return order_detail(row)
-
 
 @app.post("/api/orders", status_code=201)
 def create_order(order: NewOrder):
